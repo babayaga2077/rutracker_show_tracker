@@ -1,0 +1,19 @@
+[Unit]
+Description=RuTracker -> Telegram tracker bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --- EDIT THESE THREE to match your VM ---
+User=YOUR_LINUX_USER
+WorkingDirectory=/home/YOUR_LINUX_USER/Tg_show_tracker
+ExecStart=/home/YOUR_LINUX_USER/Tg_show_tracker/venv/bin/python bot.py
+# -----------------------------------------
+# The app reads .env from WorkingDirectory via python-dotenv, so no
+# EnvironmentFile line is needed here.
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

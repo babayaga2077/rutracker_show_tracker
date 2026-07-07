@@ -210,6 +210,14 @@ async def scheduled_check(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # -------------------------------------------------------------------- bootstrap
 def main() -> None:
     global client
+
+    # Python 3.12+ / 3.14 no longer auto-create an event loop in the main
+    # thread, which older python-telegram-bot expects. Create one explicitly.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN not set (see .env.example)")
