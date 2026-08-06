@@ -5,17 +5,22 @@ updated — i.e. new episodes were added.
 
 ## How it works
 
-Every `CHECK_INTERVAL_MINUTES` the bot opens each tracked topic page and reads
-signals that are **visible without logging in**:
+The bot uses RuTracker's official **read-only JSON API** at
+`https://api.rutracker.org/v1` — no account, no cookies, and no Cloudflare
+challenge. (Scraping `viewtopic.php` no longer works: the website returns the
+"Just a moment..." interstitial to non-browser clients.)
 
-- the first post's **edit timestamp** — `... (ред. 06-Июл-26 19:09)` — which the
-  uploader bumps whenever they add episodes, and
-- the **episode range** in the title, e.g. `Серии: 1-7 из 10`.
+Every `CHECK_INTERVAL_MINUTES` it calls `get_tor_topic_data` **once** with every
+tracked topic id (up to 100 per request) and compares:
 
-It compares these to what it saw last time; if they changed you get a
-notification with the old → new edit date and the current episode count. No
-RuTracker account is needed. If you *do* supply credentials, the torrent's
-`Зарегистрирован` (registered) date is folded in as an extra signal.
+- **`reg_time`** — when the current `.torrent` file was registered. Uploaders
+  re-upload the torrent whenever they add episodes, so this bumps. This is a
+  more reliable signal than the old post-edit-date heuristic.
+- the **episode range** parsed out of the title, e.g. `Серии: 1-7 из 10`
+- the **size** in bytes, which catches silent re-packs
+
+If any of those changed you get a notification with the old → new registration
+date, the current episode range, size and seeder count.
 
 ## Setup
 
@@ -32,19 +37,29 @@ RuTracker account is needed. If you *do* supply credentials, the torrent's
    ```
    TELEGRAM_BOT_TOKEN=...          # from BotFather
    ALLOWED_USER_IDS=               # your Telegram id (leave empty first run)
-   RUTRACKER_USERNAME=            # optional
-   RUTRACKER_PASSWORD=            # optional
+   RUTRACKER_API_BASE=https://api.rutracker.org/v1
    RUTRACKER_BASE=https://rutracker.org
-   CHECK_INTERVAL_MINUTES=120
+   CHECK_INTERVAL_MINUTES=60
    ```
 
-4. Run it:
+4. Sanity-check that the API is reachable from your machine:
+
+   ```
+   python rutracker.py 6866086
+   ```
+
+   You should see the topic title, episode range and `reg_time`. If it prints a
+   "Just a moment" complaint, `RUTRACKER_API_BASE` is pointing at the website
+   instead of the API. If the request is blocked by your ISP, switch to
+   `https://api.t-ru.org/v1`.
+
+5. Run it:
 
    ```
    python bot.py
    ```
 
-5. Message your bot `/start`. It replies with your Telegram user id. Put that id
+6. Message your bot `/start`. It replies with your Telegram user id. Put that id
    into `ALLOWED_USER_IDS` in `.env` and restart, so only you can control it.
 
 ## Commands
@@ -58,14 +73,15 @@ RuTracker account is needed. If you *do* supply credentials, the torrent's
 
 ## Notes & caveats
 
-- **Login is required** — RuTracker hides topic details from guests. If login
-  fails it's usually a wrong password, a captcha, or a blocked domain. Try a
-  mirror: set `RUTRACKER_BASE` to `https://rutracker.net` or `https://rutracker.nl`.
-- The bot detects *re-uploads* (the torrent file being replaced). Most series
-  distributions on RuTracker are updated in place this way, so a changed
-  registration date is a reliable "new episodes" signal.
-- State lives in `data.json`; login cookies in `rutracker_cookies.pkl`. Both are
-  gitignored. Delete `rutracker_cookies.pkl` to force a fresh login.
+- **No RuTracker account is needed.** `RUTRACKER_USERNAME` / `RUTRACKER_PASSWORD`
+  are no longer read; `rutracker_cookies.pkl` is unused and can be deleted.
+- The API only knows topics that have a torrent attached. A topic id that
+  returns `null` is either wrong or torrent-less.
+- `RUTRACKER_BASE` is now only used to build the clickable links in Telegram
+  messages — pick whichever mirror opens for you.
+- The first check after upgrading will fire notifications for every tracked
+  topic, because the stored signature format changed. That's expected, once.
+- State lives in `data.json` (gitignored).
 - Keep the process running (it polls continuously). To run it 24/7, wrap it in a
   `systemd` service, a `screen`/`tmux` session, Windows Task Scheduler, or
   Docker.
@@ -73,5 +89,5 @@ RuTracker account is needed. If you *do* supply credentials, the torrent's
 ## Files
 
 - `bot.py` – Telegram commands + polling loop
-- `rutracker.py` – login, fetching, and update-date parsing
+- `rutracker.py` – JSON API client (run it directly to self-test)
 - `storage.py` – JSON store of subscriptions and last-seen state

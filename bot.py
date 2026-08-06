@@ -7,8 +7,9 @@ Commands:
   /list             - list topics you track
   /check            - check all your topics right now
 
-Every CHECK_INTERVAL_MINUTES the bot polls each tracked topic and messages you
-when the release changes (post edit date and/or episode range) = new episodes.
+Every CHECK_INTERVAL_MINUTES the bot polls each tracked topic via the RuTracker
+JSON API and messages you when the release changes (the .torrent was
+re-registered and/or the episode range grew) = new episodes.
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ def _authorized(update: Update) -> bool:
 
 
 def _topic_url(topic_id: str) -> str:
-    return f"{client.base}/forum/viewtopic.php?t={topic_id}"
+    return client.topic_url(topic_id)
 
 
 def _fmt_topic(title: str, topic_id: str) -> str:
@@ -102,7 +103,7 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Error: {e}")
         return
 
-    stamp = info.edited or info.created or "n/a"
+    stamp = info.registered or "n/a"
     newly = storage.add_subscription(
         topic_id, update.effective_chat.id, info.title,
         info.signature(), stamp,
@@ -111,7 +112,8 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ep = f"\nEpisodes: {info.episodes}" if info.episodes else ""
     await update.message.reply_text(
         f"{status}: {_fmt_topic(info.title, topic_id)}\n"
-        f"Last edited: {stamp}{ep}",
+        f"Torrent registered: {stamp}\n"
+        f"Size: {info.size_human} | Seeders: {info.seeders}{ep}",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -165,39 +167,52 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def _check_topics(ctx: ContextTypes.DEFAULT_TYPE, only_chat: int | None = None) -> int:
     """Poll tracked topics; notify chats on change. Returns #changed topics."""
     topics = storage.all_topics()
+    wanted = {
+        tid: sub for tid, sub in topics.items()
+        if only_chat is None or only_chat in sub["chats"]
+    }
+    if not wanted:
+        return 0
+
+    # One batched API call for every tracked topic (100 ids per request).
+    try:
+        fetched = await asyncio.to_thread(client.fetch_topics, list(wanted))
+    except RutrackerError as e:
+        log.warning("batch check failed: %s", e)
+        return 0
+
     changed = 0
-    for topic_id, sub in topics.items():
-        chats = sub["chats"]
-        if only_chat is not None and only_chat not in chats:
-            continue
-        try:
-            info = await asyncio.to_thread(client.fetch_topic, topic_id)
-        except RutrackerError as e:
-            log.warning("check %s failed: %s", topic_id, e)
+    for topic_id, sub in wanted.items():
+        info = fetched.get(topic_id)
+        if info is None:
+            log.warning("check %s: not returned by the API", topic_id)
             continue
 
         new_sig = info.signature()
-        if new_sig != sub.get("last_signature"):
-            changed += 1
-            old = sub.get("last_updated", "n/a")
-            new_stamp = info.edited or info.created or "n/a"
-            storage.update_state(topic_id, new_sig, new_stamp, info.title)
-            ep = f"\nEpisodes: <b>{info.episodes}</b>" if info.episodes else ""
-            targets = [only_chat] if only_chat is not None else chats
-            for chat_id in targets:
-                try:
-                    await ctx.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            "\U0001F195 <b>Topic updated</b> - likely new episodes!\n"
-                            f"{_fmt_topic(info.title, topic_id)}\n"
-                            f"Edited: {old} -> <b>{new_stamp}</b>{ep}"
-                        ),
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    log.warning("notify %s failed: %s", chat_id, e)
+        if new_sig == sub.get("last_signature"):
+            continue
+
+        changed += 1
+        old = sub.get("last_updated", "n/a")
+        new_stamp = info.registered or "n/a"
+        storage.update_state(topic_id, new_sig, new_stamp, info.title)
+        ep = f"\nEpisodes: <b>{info.episodes}</b>" if info.episodes else ""
+        targets = [only_chat] if only_chat is not None else sub["chats"]
+        for chat_id in targets:
+            try:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "\U0001F195 <b>Topic updated</b> - likely new episodes!\n"
+                        f"{_fmt_topic(info.title, topic_id)}\n"
+                        f"Registered: {old} -> <b>{new_stamp}</b>{ep}\n"
+                        f"Size: {info.size_human} | Seeders: {info.seeders}"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("notify %s failed: %s", chat_id, e)
     return changed
 
 
