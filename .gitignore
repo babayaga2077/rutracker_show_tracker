@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 data.json
 rutracker_cookies.pkl
+cf_clearance.json
 venv/
 .venv/

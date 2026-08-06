@@ -7,9 +7,9 @@ Commands:
   /list             - list topics you track
   /check            - check all your topics right now
 
-Every CHECK_INTERVAL_MINUTES the bot polls each tracked topic via the RuTracker
-JSON API and messages you when the release changes (the .torrent was
-re-registered and/or the episode range grew) = new episodes.
+Every CHECK_INTERVAL_MINUTES the bot scrapes each tracked topic (through a
+Cloudflare bypass — see cloudflare.py) and messages you when the release
+changes (post edit date, episode range and/or size) = new episodes.
 """
 
 from __future__ import annotations
@@ -48,6 +48,9 @@ ALLOWED = {
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
 }
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_MINUTES", "120"))
+# Seconds to wait between topic fetches. Each check is now a real page load, so
+# don't hammer the forum — that's a good way to earn a harder challenge.
+FETCH_DELAY = float(os.getenv("FETCH_DELAY_SECONDS", "5"))
 
 client: RutrackerClient  # set in main()
 
@@ -81,8 +84,28 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/add <url|id> - track a topic\n"
         "/remove <url|id> - untrack\n"
         "/list - your tracked topics\n"
-        "/check - check now"
+        "/check - check now\n"
+        "/status - Cloudflare bypass health"
     )
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Report whether the Cloudflare bypass is actually working."""
+    if not _authorized(update):
+        return
+    n = len(storage.all_topics())
+    await update.message.reply_text(
+        f"Transport: {client.transport_summary()}\n"
+        f"Site: {client.base}\n"
+        f"Tracked topics: {n}\n"
+        f"Interval: {CHECK_INTERVAL} min, {FETCH_DELAY}s between fetches\n\n"
+        "Probing the forum..."
+    )
+    try:
+        info = await asyncio.to_thread(client.fetch_topic, "6866086")
+        await update.message.reply_text(f"OK - fetched: {info.title[:120]}")
+    except RutrackerError as e:
+        await update.message.reply_text(f"FAILED: {e}")
 
 
 async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -103,17 +126,17 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Error: {e}")
         return
 
-    stamp = info.registered or "n/a"
+    stamp = info.stamp
     newly = storage.add_subscription(
         topic_id, update.effective_chat.id, info.title,
         info.signature(), stamp,
     )
     status = "Now tracking" if newly else "Already tracking"
     ep = f"\nEpisodes: {info.episodes}" if info.episodes else ""
+    sz = f"\nSize: {info.size}" if info.size else ""
     await update.message.reply_text(
         f"{status}: {_fmt_topic(info.title, topic_id)}\n"
-        f"Torrent registered: {stamp}\n"
-        f"Size: {info.size_human} | Seeders: {info.seeders}{ep}",
+        f"Last change: {stamp}{ep}{sz}",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -174,18 +197,16 @@ async def _check_topics(ctx: ContextTypes.DEFAULT_TYPE, only_chat: int | None = 
     if not wanted:
         return 0
 
-    # One batched API call for every tracked topic (100 ids per request).
-    try:
-        fetched = await asyncio.to_thread(client.fetch_topics, list(wanted))
-    except RutrackerError as e:
-        log.warning("batch check failed: %s", e)
-        return 0
-
     changed = 0
-    for topic_id, sub in wanted.items():
-        info = fetched.get(topic_id)
-        if info is None:
-            log.warning("check %s: not returned by the API", topic_id)
+    errors: list[str] = []
+    for i, (topic_id, sub) in enumerate(wanted.items()):
+        if i:
+            await asyncio.sleep(FETCH_DELAY)   # be polite to the forum
+        try:
+            info = await asyncio.to_thread(client.fetch_topic, topic_id)
+        except RutrackerError as e:
+            log.warning("check %s failed: %s", topic_id, e)
+            errors.append(f"{topic_id}: {e}")
             continue
 
         new_sig = info.signature()
@@ -194,9 +215,10 @@ async def _check_topics(ctx: ContextTypes.DEFAULT_TYPE, only_chat: int | None = 
 
         changed += 1
         old = sub.get("last_updated", "n/a")
-        new_stamp = info.registered or "n/a"
+        new_stamp = info.stamp
         storage.update_state(topic_id, new_sig, new_stamp, info.title)
         ep = f"\nEpisodes: <b>{info.episodes}</b>" if info.episodes else ""
+        sz = f"\nSize: {info.size}" if info.size else ""
         targets = [only_chat] if only_chat is not None else sub["chats"]
         for chat_id in targets:
             try:
@@ -205,14 +227,25 @@ async def _check_topics(ctx: ContextTypes.DEFAULT_TYPE, only_chat: int | None = 
                     text=(
                         "\U0001F195 <b>Topic updated</b> - likely new episodes!\n"
                         f"{_fmt_topic(info.title, topic_id)}\n"
-                        f"Registered: {old} -> <b>{new_stamp}</b>{ep}\n"
-                        f"Size: {info.size_human} | Seeders: {info.seeders}"
+                        f"Changed: {old} -> <b>{new_stamp}</b>{ep}{sz}"
                     ),
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("notify %s failed: %s", chat_id, e)
+
+    # A silent failure loop is the worst outcome here — if the bypass breaks,
+    # the bot would look healthy while never checking anything. Speak up.
+    if errors and only_chat is not None:
+        await ctx.bot.send_message(
+            chat_id=only_chat,
+            text="⚠️ Some topics could not be checked:\n"
+                 + "\n".join(f"- {html.escape(e)}" for e in errors[:5]),
+        )
+    elif errors and len(errors) == len(wanted):
+        log.error("ALL %d topic checks failed — is FlareSolverr up? First: %s",
+                  len(errors), errors[0])
     return changed
 
 
@@ -245,6 +278,7 @@ def main() -> None:
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CommandHandler("status", cmd_status))
 
     app.job_queue.run_repeating(
         scheduled_check,
@@ -252,6 +286,13 @@ def main() -> None:
         first=30,
     )
 
+    log.info("Transport: %s", client.transport_summary())
+    if not client.session.has_solver:
+        log.warning(
+            "FLARESOLVERR_URL is not set. rutracker.org serves a JS challenge, "
+            "so checks will likely fail. Start FlareSolverr (docker compose up "
+            "-d) and set FLARESOLVERR_URL=http://localhost:8191/v1"
+        )
     log.info("Bot started. Checking every %d min. Allowed users: %s",
              CHECK_INTERVAL, ALLOWED or "ANYONE (set ALLOWED_USER_IDS!)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

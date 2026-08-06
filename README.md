@@ -5,62 +5,77 @@ updated — i.e. new episodes were added.
 
 ## How it works
 
-The bot uses RuTracker's official **read-only JSON API** at
-`https://api.rutracker.org/v1` — no account, no cookies, and no Cloudflare
-challenge. (Scraping `viewtopic.php` no longer works: the website returns the
-"Just a moment..." interstitial to non-browser clients.)
+RuTracker sits behind a Cloudflare JS challenge ("Just a moment..."), so getting
+a topic page takes two pieces:
 
-Every `CHECK_INTERVAL_MINUTES` it calls `get_tor_topic_data` **once** with every
-tracked topic id (up to 100 per request) and compares:
+| Piece | Job |
+|---|---|
+| `curl_cffi` | Impersonates a real Chrome TLS fingerprint. Without it every request is challenged no matter what cookies it carries. |
+| **FlareSolverr** | A container running headless Chrome that solves the challenge and returns a `cf_clearance` cookie. |
 
-- **`reg_time`** — when the current `.torrent` file was registered. Uploaders
-  re-upload the torrent whenever they add episodes, so this bumps. This is a
-  more reliable signal than the old post-edit-date heuristic.
-- the **episode range** parsed out of the title, e.g. `Серии: 1-7 из 10`
-- the **size** in bytes, which catches silent re-packs
+FlareSolverr is slow (~10-30s per solve), so it isn't in the hot path. The bot
+solves once, caches the cookie plus the matching User-Agent in
+`cf_clearance.json`, and makes fast normal requests until the cookie expires —
+then re-solves automatically.
 
-If any of those changed you get a notification with the old → new registration
-date, the current episode range, size and seeder count.
+Every `CHECK_INTERVAL_MINUTES` it fetches each tracked topic and compares:
+
+- the first post's **edit timestamp** — `... (ред. 06-Июл-26 19:09)` — which the
+  uploader bumps when adding episodes
+- the **episode range** in the title, e.g. `Серии: 1-7 из 10`
+- the **size**, which catches silent re-packs
+
+> **Known false alarms.** The edit date bumps for *any* edit, so an uploader
+> fixing a typo will trigger a notification. The accurate signal is the
+> torrent's `Зарегистрирован` date, but that's only visible when logged in and
+> login isn't currently wired up. See "History" below for why.
 
 ## Setup
 
-1. Install Python 3.10+ and the dependencies:
+1. Install dependencies:
 
    ```
    pip install -r requirements.txt
    ```
 
-2. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
+2. Start FlareSolverr:
 
-3. Copy `.env.example` to `.env` and fill it in:
+   ```
+   docker compose up -d
+   curl -s http://localhost:8191/health
+   ```
+
+3. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
+
+4. Copy `.env.example` to `.env` and fill it in:
 
    ```
    TELEGRAM_BOT_TOKEN=...          # from BotFather
    ALLOWED_USER_IDS=               # your Telegram id (leave empty first run)
-   RUTRACKER_API_BASE=https://api.rutracker.org/v1
    RUTRACKER_BASE=https://rutracker.org
-   CHECK_INTERVAL_MINUTES=60
+   FLARESOLVERR_URL=http://localhost:8191/v1
+   CHECK_INTERVAL_MINUTES=120
+   FETCH_DELAY_SECONDS=5
    ```
 
-4. Sanity-check that the API is reachable from your machine:
+5. Confirm the bypass works before starting the bot — the first run is slow
+   because it triggers a solve:
 
    ```
    python rutracker.py 6866086
    ```
 
-   You should see the topic title, episode range and `reg_time`. If it prints a
-   "Just a moment" complaint, `RUTRACKER_API_BASE` is pointing at the website
-   instead of the API. If the request is blocked by your ISP, switch to
-   `https://api.t-ru.org/v1`.
+   You want a Cyrillic title and an `edited` date. If you get a challenge
+   error, check `docker compose logs flaresolverr`.
 
-5. Run it:
+6. Run it:
 
    ```
    python bot.py
    ```
 
-6. Message your bot `/start`. It replies with your Telegram user id. Put that id
-   into `ALLOWED_USER_IDS` in `.env` and restart, so only you can control it.
+7. Message your bot `/start`, put the id it reports into `ALLOWED_USER_IDS`,
+   restart.
 
 ## Commands
 
@@ -70,24 +85,42 @@ date, the current episode range, size and seeder count.
 | `/remove <url or id>` | Stop tracking it |
 | `/list` | Show topics you track and their last update date |
 | `/check` | Check all your topics right now |
+| `/status` | Report bypass health and probe the forum — use this first when things look wrong |
 
 ## Notes & caveats
 
-- **No RuTracker account is needed.** `RUTRACKER_USERNAME` / `RUTRACKER_PASSWORD`
-  are no longer read; `rutracker_cookies.pkl` is unused and can be deleted.
-- The API only knows topics that have a torrent attached. A topic id that
-  returns `null` is either wrong or torrent-less.
-- `RUTRACKER_BASE` is now only used to build the clickable links in Telegram
-  messages — pick whichever mirror opens for you.
-- The first check after upgrading will fire notifications for every tracked
-  topic, because the stored signature format changed. That's expected, once.
-- State lives in `data.json` (gitignored).
-- Keep the process running (it polls continuously). To run it 24/7, wrap it in a
-  `systemd` service, a `screen`/`tmux` session, Windows Task Scheduler, or
-  Docker.
+- **FlareSolverr and the bot must share a public IP.** `cf_clearance` is bound
+  to the address that solved the challenge. Running both on the same box is
+  fine; putting FlareSolverr behind a different VPN exit is not.
+- FlareSolverr is **unauthenticated** and will fetch any URL it's given. The
+  compose file binds it to `127.0.0.1` — keep it that way.
+- Headless Chrome leaks memory over long uptimes; `mem_limit: 1g` and
+  `restart: unless-stopped` cover it.
+- Don't lower `FETCH_DELAY_SECONDS` much. Each check is a real page load, and
+  hammering the forum invites a harder challenge.
+- If **all** checks start failing, the bot logs `ALL n topic checks failed` —
+  that's the signal Cloudflare changed something, not that nothing is new.
+- State lives in `data.json`, the cached cookie in `cf_clearance.json`. Both are
+  gitignored. Delete `cf_clearance.json` to force a fresh solve.
+
+## History
+
+Worth recording, because the failure modes repeat:
+
+1. **Plain `requests` scraping** — died when Cloudflare went up over the forum.
+   Symptom: every tracked show renamed itself to "Just a moment...".
+2. **The official JSON API** (`api.rutracker.org/v1`) — clean, no challenge,
+   returned `reg_time` which was a false-alarm-free update signal. The host has
+   since been retired; it no longer resolves.
+3. **Scraping again, through the bypass** — where we are now.
+
+If the bypass breaks, check in this order: is FlareSolverr running, does
+`rutracker.org` still resolve, has a `RUTRACKER_BASE` mirror gone down.
 
 ## Files
 
 - `bot.py` – Telegram commands + polling loop
-- `rutracker.py` – JSON API client (run it directly to self-test)
+- `rutracker.py` – topic fetching and parsing (run it directly to self-test)
+- `cloudflare.py` – the challenge bypass: curl_cffi + FlareSolverr
 - `storage.py` – JSON store of subscriptions and last-seen state
+- `docker-compose.yml` – FlareSolverr only; the bot itself runs under systemd

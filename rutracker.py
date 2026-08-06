@@ -1,24 +1,28 @@
-"""RuTracker client backed by the official JSON API (no HTML, no Cloudflare).
+"""RuTracker client: guest-visible topic scraping through a Cloudflare bypass.
 
-Why the API:
-  Scraping viewtopic.php stopped working — rutracker.org sits behind a
-  Cloudflare challenge, so a plain requests.get() gets the "Just a moment..."
-  interstitial instead of the topic. The tracker's own read-only API at
-  api.rutracker.org is not behind that challenge and needs no login.
+History of this file, so the design makes sense:
+  1. Plain `requests` scraping — died when rutracker.org put the whole forum
+     behind a Cloudflare JS challenge ("Just a moment...").
+  2. The official JSON API at api.rutracker.org — clean, but the host has since
+     been retired (it no longer resolves).
+  3. Back to scraping, this time through curl_cffi + FlareSolverr. See
+     cloudflare.py for how the challenge is cleared.
 
-Endpoint used:
-  GET /v1/get_tor_topic_data?by=topic_id&val=<id>[,<id>...]
-  ->  {"result": {"<id>": {"info_hash": ..., "forum_id": ..., "size": ...,
-                           "reg_time": <unix>, "tor_status": ...,
-                           "seeders": ..., "topic_title": ...}}}
-  A missing/unknown id comes back as null.
+Update detection (all guest-visible, no account needed)
+------------------------------------------------------
+The topic's first post carries a creation time and, once the uploader adds new
+episodes, an *edit* time:
 
-Update detection:
-  reg_time is the moment the *current* .torrent file was registered. When the
-  uploader adds new episodes they re-upload the torrent, so reg_time bumps.
-  That is a stronger signal than the old post-edit-date heuristic. We also fold
-  in the episode range parsed out of topic_title (e.g. "Серии: 1-7 из 10") and
-  the size, so a silent re-pack still trips the check.
+    "02-Июн-26 18:54  (1 месяц 4 дня назад, ред. 06-Июл-26 19:09)"
+
+and the title carries the episode range, e.g. "Серии: 1-7 из 10". We watch the
+edit date, the episode range and the size together.
+
+Caveat worth knowing: the edit date bumps for *any* edit, so an uploader fixing
+a typo in the description will produce a false "new episodes" alert. The old
+API's reg_time did not have this problem, but it is gone. Logging in exposes
+the torrent's "Зарегистрирован" date, which is the accurate signal — so if
+credentials are set we fold that in and the false alarms stop.
 """
 
 from __future__ import annotations
@@ -26,18 +30,23 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional
+from dataclasses import dataclass
+from typing import Optional
 
-import requests
+from bs4 import BeautifulSoup
+
+from cloudflare import ChallengeError, CloudflareSession, describe_transport
 
 log = logging.getLogger(__name__)
 
-_UA = "rutracker-show-tracker/2.0 (+https://github.com/)"
+# dd-Mon-yy HH:MM  (Mon is a Russian abbreviation like Июн, Июл, ...)
+_DATE_RE = r"[0-3]?\d-[А-Яа-яA-Za-z]{3}-\d{2}(?:\s+\d{1,2}:\d{2})?"
 
-# The API accepts up to 100 ids per request.
-MAX_IDS_PER_REQUEST = 100
+_EP_RE = re.compile(
+    r"(?:Серии|Серия|Эпизоды|Эпизод|Episodes?|Series|Ep)\s*\.?\s*:?\s*"
+    r"(\d+\s*-\s*\d+(?:\s*(?:из|of)\s*\d+)?)",
+    re.IGNORECASE,
+)
 
 
 class RutrackerError(Exception):
@@ -48,36 +57,25 @@ class RutrackerError(Exception):
 class TopicInfo:
     topic_id: str
     title: str
-    reg_time: int = 0        # unix ts the current .torrent was registered
-    episodes: str = ""       # e.g. "1-7 из 10", parsed from the title
-    size: int = 0            # bytes
-    seeders: int = 0
-    status: int = 0          # tor_status (2 = "проверено", etc.)
-    info_hash: str = ""
-    forum_id: int = 0
-    raw: dict = field(default_factory=dict, repr=False)
+    created: str = ""       # first-post creation timestamp
+    edited: str = ""        # first-post last-edit timestamp ("ред. ...")
+    episodes: str = ""      # e.g. "1-7 из 10" parsed from the title
+    registered: str = ""    # torrent "Зарегистрирован" date (needs login)
+    size: str = ""
 
     @property
-    def registered(self) -> str:
-        """reg_time as a readable local-ish string, '' if unknown."""
-        if not self.reg_time:
-            return ""
-        return datetime.fromtimestamp(self.reg_time, timezone.utc).strftime(
-            "%d-%m-%Y %H:%M UTC"
-        )
-
-    @property
-    def size_human(self) -> str:
-        n = float(self.size)
-        for unit in ("B", "KB", "MB", "GB", "TB"):
-            if n < 1024 or unit == "TB":
-                return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
-            n /= 1024
-        return ""
+    def stamp(self) -> str:
+        """Best available human-readable 'last changed' marker."""
+        return self.registered or self.edited or self.created or "n/a"
 
     def signature(self) -> str:
-        """Compared between checks to decide whether the release changed."""
-        return "|".join([str(self.reg_time), self.episodes, str(self.size)])
+        """Compared between checks to decide if new episodes appeared.
+
+        Prefers the accurate registered date when we have it (login), otherwise
+        falls back to the guest-visible edit date.
+        """
+        primary = self.registered or self.edited or self.created
+        return "|".join([primary, self.episodes, self.size])
 
 
 def extract_topic_id(url_or_id: str) -> Optional[str]:
@@ -94,137 +92,101 @@ def extract_topic_id(url_or_id: str) -> Optional[str]:
     return None
 
 
-_EP_RE = re.compile(
-    r"(?:Серии|Серия|Эпизоды|Эпизод|Episodes?|Series|Ep)\s*\.?\s*:?\s*"
-    r"(\d+\s*-\s*\d+(?:\s*(?:из|of)\s*\d+)?)",
-    re.IGNORECASE,
-)
-
-
 def parse_episodes(title: str) -> str:
     m = _EP_RE.search(title or "")
     return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
 
 
 class RutrackerClient:
-    """Read-only client for the RuTracker JSON API."""
-
-    def __init__(self,
-                 api_base: str = "https://api.rutracker.org/v1",
-                 site_base: str = "https://rutracker.org",
-                 timeout: int = 30):
-        self.api_base = api_base.rstrip("/")
-        self.site_base = site_base.rstrip("/")
-        self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": _UA,
-            "Accept": "application/json",
-        })
-
-    # kept so bot.py can still build topic links
-    @property
-    def base(self) -> str:
-        return self.site_base
+    def __init__(self, base: str = "https://rutracker.org",
+                 flaresolverr_url: str = ""):
+        self.base = base.rstrip("/")
+        self.session = CloudflareSession(flaresolverr_url=flaresolverr_url)
 
     def topic_url(self, topic_id: str) -> str:
-        return f"{self.site_base}/forum/viewtopic.php?t={topic_id}"
+        return f"{self.base}/forum/viewtopic.php?t={topic_id}"
 
-    # ------------------------------------------------------------------ request
-    def _call(self, method: str, **params) -> dict:
-        url = f"{self.api_base}/{method}"
-        try:
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-        except requests.RequestException as e:
-            raise RutrackerError(f"Network error calling {method}: {e}") from e
+    def transport_summary(self) -> str:
+        return describe_transport(self.session)
 
-        if resp.status_code != 200:
-            raise RutrackerError(
-                f"{method} returned HTTP {resp.status_code}. "
-                "The API mirror may be down — try RUTRACKER_API_BASE="
-                "https://api.t-ru.org/v1"
-            )
-        try:
-            payload = resp.json()
-        except ValueError as e:
-            head = resp.text[:120].replace("\n", " ")
-            raise RutrackerError(
-                f"{method} did not return JSON (got: {head!r}). "
-                "If this says 'Just a moment' you're hitting the website, "
-                "not the API — check RUTRACKER_API_BASE."
-            ) from e
-
-        if isinstance(payload.get("error"), dict):
-            err = payload["error"]
-            raise RutrackerError(
-                f"API error {err.get('code')}: {err.get('text')}"
-            )
-        return payload.get("result") or {}
-
-    # ---------------------------------------------------------------- public API
-    def get_limit(self) -> int:
-        """Max ids the API accepts per request (usually 100)."""
-        res = self._call("get_limit")
-        try:
-            return int(res.get("limit", MAX_IDS_PER_REQUEST))
-        except (TypeError, ValueError):
-            return MAX_IDS_PER_REQUEST
-
-    def fetch_topics(self, topic_ids: Iterable[str]) -> Dict[str, TopicInfo]:
-        """Fetch many topics at once. Unknown ids are simply absent from the
-        returned dict."""
-        ids: List[str] = [str(t).strip() for t in topic_ids if str(t).strip()]
-        out: Dict[str, TopicInfo] = {}
-        for i in range(0, len(ids), MAX_IDS_PER_REQUEST):
-            chunk = ids[i:i + MAX_IDS_PER_REQUEST]
-            result = self._call("get_tor_topic_data",
-                                by="topic_id", val=",".join(chunk))
-            for tid, data in (result or {}).items():
-                if not data:          # null == no such topic / no torrent
-                    continue
-                out[str(tid)] = self._to_info(str(tid), data)
-        return out
-
+    # -------------------------------------------------------------- fetch topic
     def fetch_topic(self, topic_id: str) -> TopicInfo:
-        """Fetch a single topic. Raises if the id is unknown."""
-        topics = self.fetch_topics([topic_id])
-        info = topics.get(str(topic_id))
-        if info is None:
-            raise RutrackerError(
-                f"Topic {topic_id} not found (or it has no torrent attached). "
-                "Double-check the viewtopic.php?t=... id."
-            )
-        return info
+        url = self.topic_url(topic_id)
+        try:
+            html = self.session.get(url)
+        except ChallengeError as e:
+            raise RutrackerError(str(e)) from e
+        except Exception as e:  # noqa: BLE001
+            raise RutrackerError(f"Network error fetching topic {topic_id}: {e}") from e
+        return self._parse(topic_id, html)
 
-    # ------------------------------------------------------------------- mapping
+    # ------------------------------------------------------------------- parse
     @staticmethod
-    def _to_info(topic_id: str, data: dict) -> TopicInfo:
-        title = str(data.get("topic_title") or "").strip()
-        return TopicInfo(
-            topic_id=topic_id,
-            title=title,
-            reg_time=_int(data.get("reg_time")),
-            episodes=parse_episodes(title),
-            size=_int(data.get("size")),
-            seeders=_int(data.get("seeders")),
-            status=_int(data.get("tor_status")),
-            info_hash=str(data.get("info_hash") or ""),
-            forum_id=_int(data.get("forum_id")),
-            raw=data,
-        )
+    def _parse(topic_id: str, html: str) -> TopicInfo:
+        soup = BeautifulSoup(html, "html.parser")
+
+        # ---- title
+        title = ""
+        h1 = soup.select_one("h1.maintitle, a.maintitle, #topic-title")
+        if h1:
+            title = h1.get_text(" ", strip=True)
+        if not title:
+            t = soup.find("title")
+            if t:
+                title = t.get_text(strip=True)
+        title = re.sub(r"\s*::\s*RuTracker.*$", "", title).strip()
+
+        # Guard against silently storing a challenge/error page as the title.
+        if not title or title.lower().startswith(("just a moment", "attention required",
+                                                  "access denied", "error")):
+            raise RutrackerError(
+                f"Could not parse topic {topic_id} — got a block/challenge page "
+                "instead of the topic. Check that FlareSolverr is running."
+            )
+
+        text = soup.get_text("\n", strip=True)
+
+        # ---- first-post creation + edit dates
+        created = edited = ""
+        pt = soup.select_one("p.post-time, .post_head .p-link, span.p-link")
+        pt_text = pt.get_text(" ", strip=True) if pt else ""
+        scope = pt_text or text
+
+        m_edit = re.search(r"ред\.\s*(" + _DATE_RE + r")", scope)
+        if m_edit:
+            edited = _norm(m_edit.group(1))
+        m_created = re.search(_DATE_RE, scope)
+        if m_created:
+            created = _norm(m_created.group(0))
+
+        # ---- episode range from the title, e.g. "Серии: 1-7 из 10"
+        episodes = parse_episodes(title)
+
+        # ---- torrent registered date (only visible when logged in)
+        registered = ""
+        m_reg = re.search(r"Зарегистрирован\s*\[?\s*(" + _DATE_RE + r")", text)
+        if m_reg:
+            registered = _norm(m_reg.group(1))
+
+        # ---- size
+        size = ""
+        ms = re.search(r"(?:Размер|Size)\s*[:\s]\s*([\d.,]+\s?[КМГKMGТ]?i?B)", text)
+        if ms:
+            size = ms.group(1).strip()
+
+        return TopicInfo(topic_id=topic_id, title=title, created=created,
+                         edited=edited, episodes=episodes,
+                         registered=registered, size=size)
 
 
-def _int(v) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return 0
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def build_client_from_env() -> RutrackerClient:
     return RutrackerClient(
-        api_base=os.getenv("RUTRACKER_API_BASE", "https://api.rutracker.org/v1"),
-        site_base=os.getenv("RUTRACKER_BASE", "https://rutracker.org"),
+        base=os.getenv("RUTRACKER_BASE", "https://rutracker.org"),
+        flaresolverr_url=os.getenv("FLARESOLVERR_URL", ""),
     )
 
 
@@ -232,28 +194,35 @@ def build_client_from_env() -> RutrackerClient:
 if __name__ == "__main__":
     import sys
 
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = sys.argv[1:] or ["6866086"]
     c = build_client_from_env()
-    print(f"API base: {c.api_base}")
-    try:
-        print(f"Per-request id limit: {c.get_limit()}")
-    except RutrackerError as e:
-        print(f"get_limit failed: {e}")
+    print(f"Site:      {c.base}")
+    print(f"Transport: {c.transport_summary()}")
+    print()
 
-    try:
-        topics = c.fetch_topics(extract_topic_id(a) or a for a in args)
-    except RutrackerError as e:
-        raise SystemExit(f"FAILED: {e}")
-
-    if not topics:
-        raise SystemExit("No topics returned — check the ids.")
-    for tid, t in topics.items():
+    failures = 0
+    for a in args:
+        tid = extract_topic_id(a) or a
+        try:
+            t = c.fetch_topic(tid)
+        except RutrackerError as e:
+            failures += 1
+            print(f"FAILED {tid}: {e}")
+            continue
         print("-" * 70)
-        print(f"id        {tid}")
-        print(f"title     {t.title}")
-        print(f"episodes  {t.episodes or '-'}")
-        print(f"reg_time  {t.reg_time}  ({t.registered})")
-        print(f"size      {t.size_human}")
-        print(f"seeders   {t.seeders}")
-        print(f"signature {t.signature()}")
+        print(f"id         {t.topic_id}")
+        print(f"title      {t.title}")
+        print(f"episodes   {t.episodes or '-'}")
+        print(f"created    {t.created or '-'}")
+        print(f"edited     {t.edited or '-'}")
+        print(f"registered {t.registered or '- (needs login)'}")
+        print(f"size       {t.size or '-'}")
+        print(f"signature  {t.signature()}")
+    sys.exit(1 if failures else 0)
