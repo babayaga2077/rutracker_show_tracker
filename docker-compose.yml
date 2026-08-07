@@ -21,14 +21,18 @@ services:
     environment:
       - LOG_LEVEL=info
       - TZ=Europe/Moscow
-      # Browser stays warm between solves; drop to 300 if RAM is tight.
-      - BROWSER_TIMEOUT=40000
-    # Headless Chrome is memory-hungry and leaks over long uptimes.
-    mem_limit: 1g
-    shm_size: 256m
+      # Generous, because Chrome starts very slowly on a burst-vCPU instance.
+      # FlareSolverr's own startup self-test gives up at 120s and the container
+      # then dies, so this needs headroom on small boxes.
+      - BROWSER_TIMEOUT=180000
+    # Chrome maps a lot of shared memory; 256m is where it starts crashing.
+    shm_size: 1g
+    # No mem_limit on purpose. Capping it below what Chrome wants turns a slow
+    # start into an OOM kill. Control memory with host swap instead.
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8191/health || exit 1"]
+      # The image has no curl, so probe with the Python that's already in it.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8191/health', timeout=5).status==200 else 1)\""]
       interval: 60s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 180s
